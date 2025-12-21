@@ -2,18 +2,19 @@ from pathlib import Path
 from epub_generator import TocItem, ChapterGetter
 
 from ..common import read_xml
-from ..toc import decode, TocItem as RawTocItem
+from ..toc import decode, Toc
 
 
 class TocCollection:
     def __init__(self, toc_path: Path | None) -> None:
-        self._root: list[RawTocItem]
+        self._root: list[Toc]
         self._root_toc_items: list[TocItem] = []
         self._extra_toc_items: list[TocItem] = []
         self._id_to_toc_item: dict[int, TocItem] = {}
+        self._having_body_toc_set: set[int] = set()
 
         if toc_path:
-            self._root = decode(read_xml(toc_path))
+            self._root = decode(read_xml(toc_path)).content
         else:
             self._root = []
 
@@ -21,9 +22,10 @@ class TocCollection:
     def target(self) -> list[TocItem]:
         return self._root_toc_items + self._extra_toc_items
 
-    def collect(self, id: int, title: str, get_chapter: ChapterGetter) -> None:
+    def collect(self, toc_id: int, title: str, have_body: bool, get_chapter: ChapterGetter | None) -> None:
         toc_item: TocItem | None = None
-        stack = self._find_raw_toc_item_stack(id)
+        stack = self._find_raw_toc_item_stack(toc_id)
+
         if stack:
             current_toc_items = self._root_toc_items
             for raw_item in stack:
@@ -38,12 +40,20 @@ class TocCollection:
                 get_chapter=get_chapter,
             )
             self._extra_toc_items.append(toc_item)
-            self._id_to_toc_item[id] = toc_item
+            self._id_to_toc_item[toc_id] = toc_item
 
-    def _find_raw_toc_item_stack(self, id: int) -> list[RawTocItem]:
+        if have_body:
+            self._having_body_toc_set.add(id(toc_item))
+
+    def normalize(self) -> "TocCollection":
+        self._clean_no_content_items(self._root_toc_items)
+        self._clean_no_content_items(self._extra_toc_items)
+        return self
+
+    def _find_raw_toc_item_stack(self, toc_id: int) -> list[Toc]:
         index: int = 0
-        current_toc_items: list[RawTocItem] = self._root
-        stack: list[tuple[int, list[RawTocItem], RawTocItem]] = []
+        current_toc_items: list[Toc] = self._root
+        stack: list[tuple[int, list[Toc], Toc]] = []
         while True:
             if index >= len(current_toc_items):
                 if not stack:
@@ -53,7 +63,7 @@ class TocCollection:
             else:
                 item = current_toc_items[index]
                 stack.append((index, current_toc_items, item))
-                if item.id == id:
+                if item.id == toc_id:
                     break
                 current_toc_items = item.children
                 index = 0
@@ -75,3 +85,20 @@ class TocCollection:
             toc_items.append(toc_item)
             self._id_to_toc_item[id] = toc_item
         return toc_item
+
+    def _clean_no_content_items(self, toc_items: list[TocItem]):
+        index = 0
+        while index < len(toc_items):
+            should_keep = True
+            toc_item = toc_items[index]
+            self._clean_no_content_items(toc_item.children)
+
+            if id(toc_item) not in self._having_body_toc_set and not toc_item.children:
+                # 有子节点同时自己也没有内容，变为仅存在于目录中的章节有助于更好的阅读体验
+                toc_item.get_chapter = None
+                should_keep = False
+
+            if should_keep:
+                index += 1
+            else:
+                toc_items.pop(index)

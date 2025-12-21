@@ -2,46 +2,84 @@ from pathlib import Path
 from typing import Generator
 
 from ..common import save_xml, XMLReader
-from ..pdf import decode, Page
-from .jointer import TITLE_TAGS, Jointer
-from .chapter import encode, Reference, Chapter, AssetLayout, InlineExpression, ParagraphLayout, LineLayout
+from ..pdf import decode, Page, TITLE_TAGS
+from ..toc import iter_toc, Toc, TocInfo
+
+from .jointer import Jointer
+from .content import join_texts_in_content, expand_text_in_content
+from .chapter import encode, Reference, Chapter, AssetLayout, ParagraphLayout, BlockLayout
+from .analyse_level import analyse_chapter_internal_levels
 from .reference import References
 from .mark import search_marks, Mark
 
 
-def generate_chapter_files(pages_path: Path, chapters_path: Path):
+def generate_chapter_files(pages_path: Path, chapters_path: Path, toc: TocInfo):
     chapters_path.mkdir(parents=True, exist_ok=True)
     for chapter_file in chapters_path.glob("chapter_*.xml"):
         chapter_file.unlink()
 
-    for i, chapter in enumerate(_generate_chapters(pages_path)):
-        chapter_file = chapters_path / f"chapter_{i + 1}.xml"
+    for chapter in _generate_chapters(
+        pages_path=pages_path,
+        toc=toc,
+    ):
+        tail: str
+        if chapter.id is None:
+            tail = "head"
+        else:
+            tail = f"{chapter.id}"
+
+        chapter = analyse_chapter_internal_levels(chapter)
+        chapter_file = chapters_path / f"chapter_{tail}.xml"
         chapter_element = encode(chapter)
         save_xml(chapter_element, chapter_file)
 
-def _generate_chapters(pages_path: Path):
+def _generate_chapters(pages_path: Path, toc: TocInfo) -> Generator[Chapter, None, None]:
     chapter: Chapter | None = None
-    for layout in _extract_body_layouts(pages_path):
-        if isinstance(layout, ParagraphLayout) and layout.ref in TITLE_TAGS:
-            if chapter:
-                yield chapter
-            chapter = Chapter(title=layout, layouts=[])
-        else:
+    ref2toc: dict[tuple[int, int], Toc] = {}
+
+    for item in iter_toc(toc.content):
+        ref2toc[(item.page_index, item.order)] = item
+
+    for layout in _extract_body_layouts(pages_path, toc):
+        matched_toc = False
+        if isinstance(layout, ParagraphLayout) and layout.blocks and layout.ref in TITLE_TAGS:
+            item: Toc | None = None
+            for block in layout.blocks:
+                item = ref2toc.get((block.page_index, block.order), None)
+                if item:
+                    break
+            if item:
+                if chapter:
+                    yield chapter
+                chapter = Chapter(
+                    id=item.id,
+                    level=item.level,
+                    layouts=[layout],
+                )
+                matched_toc = True
+
+        if not matched_toc:
             if chapter is None:
-                chapter = Chapter(title=None, layouts=[])
+                max_level= max((t.level for t in iter_toc(toc.content)), default=0)
+                chapter = Chapter(
+                    id=None,
+                    level=max_level, # 防止章节标题盖过其他
+                    layouts=[],
+                )
             chapter.layouts.append(layout)
 
     if chapter:
         yield chapter
 
-def _extract_body_layouts(pages_path: Path):
+def _extract_body_layouts(pages_path: Path, toc: TocInfo):
     pages: XMLReader[Page] = XMLReader(
         prefix="page",
         dir_path=pages_path,
         decode=decode,
     )
-    body_jointer = Jointer(((p.index, p.body_layouts) for p in pages.read()))
-    footnotes_jointer = Jointer(((p.index, p.footnotes_layouts) for p in pages.read()))
+    toc_page_indexes = set(toc.page_indexes)
+    body_jointer = Jointer(((p.index, p.body_layouts) for p in pages.read() if p.index not in toc_page_indexes))
+    footnotes_jointer = Jointer(((p.index, p.footnotes_layouts) for p in pages.read() if p.index not in toc_page_indexes))
     references_generator = _extract_page_references(footnotes_jointer)
     current_references: References | None = next(references_generator, None)
 
@@ -55,10 +93,12 @@ def _extract_body_layouts(pages_path: Path):
 
     for layout in body_jointer.execute():
         if isinstance(layout, ParagraphLayout):
-            for line in layout.lines:
-                references = get_references(line.page_index)
+            for block in layout.blocks:
+                references = get_references(block.page_index)
                 if references:
-                    line.content = list(_line_parts_after_replace_references(references, line))
+                    _replace_mark_with_reference(references, block)
+                join_texts_in_content(block.content)
+
         yield layout
 
 def _extract_page_references(jointer: Jointer) -> Generator[References, None, None]:
@@ -85,37 +125,26 @@ def _extract_page_references(jointer: Jointer) -> Generator[References, None, No
 
 def _page_index_from_layout(layout: AssetLayout | ParagraphLayout) -> int:
     if isinstance(layout, ParagraphLayout):
-        return layout.lines[0].page_index
+        if not layout.blocks:
+            raise ValueError("ParagraphLayout has no blocks to get page index")
+        return layout.blocks[0].page_index
     elif isinstance(layout, AssetLayout):
         return layout.page_index
     else:
-        raise ValueError("Unknown layout type")
+        raise TypeError(f"Unknown layout type: {type(layout).__name__}")
 
 
-def _line_parts_after_replace_references(references: References, line: LineLayout) -> Generator[str | InlineExpression | Reference, None, None]:
-    text_buffer: list[str] = []
-    for part in _search_mark_and_split_line(references, line.content):
-        if isinstance(part, str):
-            text_buffer.append(part)
-        elif text_buffer:
-            yield "".join(text_buffer)
-            text_buffer = []
-            yield part
-    if text_buffer:
-        yield "".join(text_buffer)
-
-def _search_mark_and_split_line(references: References, parts: list[str | InlineExpression | Reference]):
-    for part in parts:
-        if isinstance(part, Reference):
-            yield part
-        elif isinstance(part, InlineExpression):
-            yield part
-        else:
-            for item in search_marks(part):
-                reference: Reference | None = None
-                if isinstance(item, Mark):
-                    reference = references.get(item)
-                if reference:
-                    yield reference
-                else:
-                    yield str(item)
+def _replace_mark_with_reference(references: References, block: BlockLayout):
+    def expand(text: str):
+        for item in search_marks(text):
+            reference: Reference | None = None
+            if isinstance(item, Mark):
+                reference = references.get(item)
+            if reference:
+                yield reference
+            else:
+                yield str(item)
+    expand_text_in_content(
+        content=block.content,
+        expand=expand,
+    )

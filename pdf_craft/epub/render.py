@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Generator
 from epub_generator import (
     generate_epub,
     EpubData,
@@ -8,21 +8,24 @@ from epub_generator import (
     LaTeXRender,
     Chapter as ChapterRecord,
     ChapterGetter,
-    Text,
+    TextBlock,
     Image,
+    Table,
     Formula,
     Footnote,
     Mark,
     TextKind,
+    HTMLTag as EpubHTMLTag,
 )
 
 from .toc_collection import TocCollection
 from .latex_to_text import latex_to_plain_text
 
-from ..common import XMLReader
+from ..markdown.paragraph import flatten, HTMLTag
 from ..metering import check_aborted, AbortedCheck
+from ..pdf import TITLE_TAGS
 from ..sequence import (
-    decode,
+    create_chapters_reader,
     search_references_in_chapter,
     references_to_map,
     InlineExpression,
@@ -47,13 +50,9 @@ def render_epub_file(
         aborted: AbortedCheck,
     ):
 
-    chapters: XMLReader[Chapter] = XMLReader(
-        prefix="chapter",
-        dir_path=chapters_path,
-        decode=decode,
-    )
+    read_chapters = create_chapters_reader(chapters_path)
     references: list[Reference] = []
-    for chapter in chapters.read():
+    for chapter in read_chapters():
         references.extend(search_references_in_chapter(chapter))
 
     references.sort(key=lambda ref: (ref.page_index, ref.order))
@@ -61,7 +60,7 @@ def render_epub_file(
     get_head: ChapterGetter | None = None
     toc_collection = TocCollection(toc_path)
 
-    for i, chapter in enumerate(chapters.read()):
+    for chapter in read_chapters():
         def get_chapter(ch=chapter):
             return _convert_chapter_to_epub(
                 chapter=ch,
@@ -69,19 +68,26 @@ def render_epub_file(
                 inline_latex=inline_latex,
                 ref_id_to_number=ref_id_to_number,
             )
-        if chapter.title is None:
+        if chapter.id is None:
             get_head = get_chapter
-        else:
-            toc_collection.collect(
-                id=i + 1,
-                title=_extract_chapter_title(chapter),
-                get_chapter=get_chapter,
-            )
+        elif chapter.layouts:
+            first_layout = chapter.layouts[0]
+            if isinstance(first_layout, ParagraphLayout) and first_layout.ref in TITLE_TAGS:
+                title = "".join(_iter_text_in_title(first_layout)).strip()
+                if not title:
+                    title = "Untitled"
+                have_body = len(chapter.layouts) > 1
+                toc_collection.collect(
+                    toc_id=chapter.id,
+                    title=title,
+                    have_body=have_body,
+                    get_chapter=get_chapter if have_body else None,
+                )
 
     epub_data = EpubData(
         meta=book_meta,
         get_head=get_head,
-        chapters=toc_collection.target,
+        chapters=toc_collection.normalize().target,
         cover_image_path=cover_path,
     )
     check_aborted(aborted)
@@ -94,15 +100,11 @@ def render_epub_file(
         assert_not_aborted=lambda: check_aborted(aborted),
     )
 
-def _extract_chapter_title(chapter: Chapter) -> str:
-    if chapter.title is not None:
-        text_parts = []
-        for line in chapter.title.lines:
-            for part in line.content:
-                if isinstance(part, str):
-                    text_parts.append(part)
-        return " ".join(text_parts).strip() if text_parts else "Untitled"
-    return "Untitled"
+def _iter_text_in_title(title_layout: ParagraphLayout):
+    for block in title_layout.blocks:
+        for item in flatten(block.content):
+            if isinstance(item, str):
+                yield item
 
 def _convert_chapter_to_epub(
     chapter: Chapter,
@@ -113,28 +115,30 @@ def _convert_chapter_to_epub(
     elements = []
     footnotes = []
 
-    if chapter.title is not None:
-        title_content = list(_render_paragraph_with_marks(
-            layout=chapter.title,
-            inline_latex=inline_latex,
-            ref_id_to_number=ref_id_to_number,
-        ))
-        if title_content:
-            elements.append(Text(kind=TextKind.HEADLINE, content=title_content))
-
     for layout in chapter.layouts:
         if isinstance(layout, AssetLayout):
-            asset_element = _convert_asset_to_epub(layout, assets_path)
+            asset_element = _convert_asset_to_epub(
+                asset=layout,
+                assets_path=assets_path,
+                inline_latex=inline_latex,
+                ref_id_to_number=ref_id_to_number,
+            )
             if asset_element:
                 elements.append(asset_element)
         elif isinstance(layout, ParagraphLayout):
-            paragraph_content = list(_render_paragraph_with_marks(
-                layout=layout,
-                inline_latex=inline_latex,
-                ref_id_to_number=ref_id_to_number),
-            )
-            if paragraph_content:
-                elements.append(Text(kind=TextKind.BODY, content=paragraph_content))
+            content: list[str | Formula | Mark | EpubHTMLTag] = []
+            for block in layout.blocks:
+                content.extend(_transform_content(
+                    content=block.content,
+                    inline_latex=inline_latex,
+                    ref_id_to_number=None,
+                ))
+            if content:
+                elements.append(TextBlock(
+                    kind=TextKind.HEADLINE if layout.ref in TITLE_TAGS else TextKind.BODY,
+                    level=layout.level,
+                    content=content,
+                ))
 
     chapter_refs = search_references_in_chapter(chapter)
     for ref in chapter_refs:
@@ -149,12 +153,46 @@ def _convert_chapter_to_epub(
 
     return ChapterRecord(elements=elements, footnotes=footnotes)
 
-def _convert_asset_to_epub(asset: AssetLayout, assets_path: Path):
+def _extract_text_from_content(
+    content: list[str | InlineExpression | Reference | HTMLTag],
+) -> str:
+    """Extract plain text from asset content list (for Formula latex_expression)."""
+    parts = []
+    for item in flatten(content):
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, InlineExpression):
+            parts.append(item.content)
+    return "".join(parts).strip()
+
+def _convert_asset_to_epub(
+    asset: AssetLayout,
+    assets_path: Path,
+    inline_latex: bool = False,
+    ref_id_to_number: dict | None = None,
+):
+
+    title = list(_transform_content(
+        content=asset.title,
+        inline_latex=inline_latex,
+        ref_id_to_number=ref_id_to_number,
+    ))
+    caption = list(_transform_content(
+        content=asset.caption,
+        inline_latex=inline_latex,
+        ref_id_to_number=ref_id_to_number,
+    ))
     if asset.ref == "equation":
-        latex_expression = asset.content.strip()
+        latex_expression = _extract_text_from_content(asset.content)
         if not latex_expression:
             return None
-        return Formula(latex_expression)
+
+
+        return Formula(
+            latex_expression=latex_expression,
+            title=title,
+            caption=caption,
+        )
 
     elif asset.ref == "image":
         if asset.hash is None:
@@ -164,31 +202,41 @@ def _convert_asset_to_epub(asset: AssetLayout, assets_path: Path):
         if not image_file.exists():
             return None
 
-        alt_parts = []
-        if asset.title:
-            alt_parts.append(asset.title)
-        if asset.caption:
-            alt_parts.append(asset.caption)
-        alt_text = " - ".join(alt_parts) if alt_parts else "image"
-
-        return Image(path=image_file, alt_text=alt_text)
+        return Image(
+            path=image_file,
+            title=title,
+            caption=caption,
+        )
 
     elif asset.ref == "table":
         if asset.hash is None:
             return None
 
-        table_file = assets_path / f"{asset.hash}.png"
-        if not table_file.exists():
-            return None
+        html_content: EpubHTMLTag | None = None
+        for item in _transform_content(
+            content=asset.content,
+            inline_latex=inline_latex,
+            ref_id_to_number=ref_id_to_number,
+        ):
+            if isinstance(item, EpubHTMLTag):
+                html_content = item
+                break
 
-        alt_parts = []
-        if asset.title:
-            alt_parts.append(asset.title)
-        if asset.caption:
-            alt_parts.append(asset.caption)
-        alt_text = " - ".join(alt_parts) if alt_parts else "table"
-
-        return Image(path=table_file, alt_text=alt_text)
+        if html_content is None:
+            table_file = assets_path / f"{asset.hash}.png"
+            if not table_file.exists():
+                return None
+            return Image(
+                path=table_file,
+                title=title,
+                caption=caption,
+            )
+        else:
+            return Table(
+                title=title,
+                caption=caption,
+                html_content=html_content,
+            )
 
     return None
 
@@ -199,33 +247,56 @@ def _convert_reference_to_footnote_contents(
     ):
     for layout in ref.layouts:
         if isinstance(layout, AssetLayout):
-            asset_element = _convert_asset_to_epub(layout, assets_path)
+            asset_element = _convert_asset_to_epub(
+                asset=layout,
+                assets_path=assets_path,
+                inline_latex=inline_latex,
+                ref_id_to_number=None,
+            )
             if asset_element:
                 yield asset_element
         elif isinstance(layout, ParagraphLayout):
-            content_parts = list(_render_paragraph_with_marks(
-                layout=layout,
-                inline_latex=inline_latex,
-            ))
-            if content_parts:
-                yield Text(kind=TextKind.BODY, content=content_parts)
+            content: list[str | Formula | Mark | EpubHTMLTag] = []
+            for block in layout.blocks:
+                content.extend(_transform_content(
+                    content=block.content,
+                    inline_latex=inline_latex,
+                    ref_id_to_number=None,
+                ))
+            if content:
+                yield TextBlock(
+                    kind=TextKind.BODY,
+                    level=layout.level,
+                    content=content,
+                )
 
-def _render_paragraph_with_marks(
-        layout: ParagraphLayout,
-        inline_latex: bool,
-        ref_id_to_number: dict | None = None,
-    ):
-    for line in layout.lines:
-        for part in line.content:
-            if isinstance(part, str):
-                yield part
-            elif isinstance(part, InlineExpression):
-                if inline_latex:
-                    yield Formula(latex_expression=part.content.strip())
-                else:
-                    yield latex_to_plain_text(
-                        latex_content=part.content.strip(),
-                    )
-            elif ref_id_to_number and isinstance(part, Reference):
-                ref_number = ref_id_to_number.get(part.id, 1)
-                yield Mark(id=ref_number)
+def _transform_content(
+    content: list[str | InlineExpression | Reference | HTMLTag],
+    inline_latex: bool,
+    ref_id_to_number: dict | None = None,
+) -> Generator[str | Formula | Mark | EpubHTMLTag, None, None]:
+
+    for item in content:
+        if isinstance(item, str):
+            yield item
+
+        elif isinstance(item, InlineExpression):
+            if inline_latex:
+                yield Formula(latex_expression=item.content.strip())
+            else:
+                yield latex_to_plain_text(latex_content=item.content.strip())
+
+        elif ref_id_to_number and isinstance(item, Reference):
+            ref_number = ref_id_to_number.get(item.id, 1)
+            yield Mark(id=ref_number)
+
+        elif isinstance(item, HTMLTag):
+            yield EpubHTMLTag(
+                name=item.definition.name,
+                attributes=item.attributes,
+                content=list(_transform_content(
+                    content=item.children,
+                    inline_latex=inline_latex,
+                    ref_id_to_number=ref_id_to_number,
+                )),
+            )

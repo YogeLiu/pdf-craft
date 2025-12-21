@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "pdf-craft"
-version = "1.0.3"
+version = "1.0.5"
 description = "PDF craft can convert PDF files into various other formats. This project will focus on processing PDF files of scanned books."
 license = "MIT"
 authors = ["Tao Zeyu <i@taozeyu.com>"]
@@ -33,9 +33,10 @@ classifiers = [
 python = ">=3.10,<3.14"
 pdf2image = "^1.17.0"
 pypdf = "^6.4.1"
-doc-page-extractor = "==1.0.10"
-epub-generator = "==0.1.2"
+doc-page-extractor = "==1.0.12"
+epub-generator = "==0.1.5"
 pylatexenc = "^2.10"
+pyahocorasick = "^2.2.0"
 
 [tool.poetry.group.dev.dependencies]
 pylint = "^3.3.7"

@@ -2,6 +2,9 @@
     "[xml]": {
         "editor.wordWrap": "on"
     },
+    "[xhtml]": {
+        "editor.wordWrap": "on"
+    },
     "[python]": {
         "editor.formatOnSave": false,
         "editor.codeActionsOnSave": {
@@ -15,6 +18,8 @@
     "python.analysis.typeCheckingMode": "basic",
     "files.trimTrailingWhitespace": true,
     "cSpell.words": [
+        "ahocorasick",
+        "analysed",
         "analysing",
         "clazz",
         "CUDA",
@@ -24,15 +29,23 @@
         "gundam",
         "LOCALAPPDATA",
         "MATHML",
+        "metas",
+        "noembed",
+        "noframes",
+        "Nonspacing",
         "OOMOL",
         "pdfinfo",
         "pixmap",
         "poppler",
+        "pyahocorasick",
         "pyenv",
         "pylatexenc",
         "pylint",
+        "pypdf",
         "pytest",
+        "REGX",
         "SSOHH'mm",
+        "tagfilter",
         "torchvision",
         "venv",
         "virtualenvs",

@@ -5,14 +5,15 @@ from typing import Callable, Literal
 from epub_generator import BookMeta, TableRender, LaTeXRender
 
 from .common import EnsureFolder
+from .error import PDFError
 from .to_path import to_path
 from .pdf import OCR, OCREvent, PDFHandler, DeepSeekOCRSize
 from .sequence import generate_chapter_files
-from .toc import generate_toc_file
-from .markdown import render_markdown_file
+from .toc import analyse_toc
 from .epub import render_epub_file
 from .error import is_inline_error, to_interrupted_error
 from .metering import AbortedCheck, OCRTokensMetering
+from .markdown.render import render_markdown_file
 
 
 class Transform:
@@ -43,6 +44,7 @@ class Transform:
         ocr_size: DeepSeekOCRSize = "gundam",
         includes_footnotes: bool = False,
         generate_plot: bool = False,
+        toc_assumed: bool = False,
         ignore_pdf_errors: bool = False,
         aborted: AbortedCheck = lambda: False,
         max_ocr_tokens: int | None = None,
@@ -58,7 +60,7 @@ class Transform:
             with EnsureFolder(
                 path=to_path(analysing_path) if analysing_path is not None else None,
             ) as analysing_path:
-                asserts_path, chapters_path, _, metering = self._extract_from_pdf(
+                asserts_path, chapters_path, _, _, metering = self._extract_from_pdf(
                     pdf_path=Path(pdf_path),
                     analysing_path=analysing_path,
                     ocr_size=ocr_size,
@@ -66,6 +68,7 @@ class Transform:
                     includes_footnotes=includes_footnotes,
                     ignore_pdf_errors=ignore_pdf_errors,
                     generate_plot=generate_plot,
+                    toc_assumed=toc_assumed,
                     aborted=aborted,
                     max_tokens=max_ocr_tokens,
                     max_output_tokens=max_ocr_output_tokens,
@@ -99,6 +102,7 @@ class Transform:
         includes_footnotes: bool = False,
         ignore_pdf_errors: bool = False,
         generate_plot: bool = False,
+        toc_assumed: bool = True,
         book_meta: BookMeta | None = None,
         lan: Literal["zh", "en"] = "zh",
         table_render: TableRender = TableRender.HTML,
@@ -114,8 +118,7 @@ class Transform:
                 path=to_path(analysing_path) if analysing_path is not None else None,
             ) as analysing_path:
                 pdf_path = Path(pdf_path)
-                toc_path: Path | None = analysing_path / "toc.xml"
-                asserts_path, chapters_path, cover_path, metering = self._extract_from_pdf(
+                asserts_path, chapters_path, toc_path, cover_path, metering = self._extract_from_pdf(
                     pdf_path=pdf_path,
                     analysing_path=analysing_path,
                     ocr_size=ocr_size,
@@ -123,12 +126,12 @@ class Transform:
                     includes_footnotes=includes_footnotes,
                     ignore_pdf_errors=ignore_pdf_errors,
                     generate_plot=generate_plot,
+                    toc_assumed=toc_assumed,
                     aborted=aborted,
                     max_tokens=max_ocr_tokens,
                     max_output_tokens=max_ocr_output_tokens,
                     on_ocr_event=on_ocr_event,
                 )
-                toc_path = generate_toc_file(chapters_path, toc_path)
                 book_meta = book_meta or self._extract_book_meta(pdf_path)
 
                 render_epub_file(
@@ -164,6 +167,7 @@ class Transform:
         includes_footnotes: bool,
         ignore_pdf_errors: bool,
         generate_plot: bool,
+        toc_assumed: bool,
         aborted: AbortedCheck,
         max_tokens: int | None,
         max_output_tokens: int | None,
@@ -173,6 +177,7 @@ class Transform:
         asserts_path = analysing_path / "assets"
         pages_path = analysing_path / "ocr"
         chapters_path = analysing_path / "chapters"
+        toc_path = analysing_path / "toc.xml"
 
         cover_path: Path | None = None
         plot_path: Path | None = None
@@ -202,21 +207,34 @@ class Transform:
             metering.input_tokens += event.input_tokens
             metering.output_tokens += event.output_tokens
 
+        toc = analyse_toc(
+            pages_path=pages_path,
+            toc_path=toc_path,
+            toc_assumed=toc_assumed,
+        )
         generate_chapter_files(
             pages_path=pages_path,
             chapters_path=chapters_path,
+            toc=toc,
         )
-        return asserts_path, chapters_path, cover_path, metering
+        if cover_path and not cover_path.exists():
+            cover_path = None
 
-    def _extract_book_meta(self, pdf_path: Path) -> BookMeta:
-        pdf_metadata = self._ocr.metadata(pdf_path)
-        return BookMeta(
-            title=pdf_metadata.title or pdf_path.stem,
-            description=pdf_metadata.description,
-            publisher=pdf_metadata.publisher,
-            isbn=pdf_metadata.isbn,
-            authors=pdf_metadata.authors,
-            editors=pdf_metadata.editors,
-            translators=pdf_metadata.translators,
-            modified=pdf_metadata.modified,
-        )
+        return asserts_path, chapters_path, toc_path, cover_path, metering
+
+    def _extract_book_meta(self, pdf_path: Path) -> BookMeta | None:
+        try:
+            pdf_metadata = self._ocr.metadata(pdf_path)
+            return BookMeta(
+                title=pdf_metadata.title or pdf_path.stem,
+                description=pdf_metadata.description,
+                publisher=pdf_metadata.publisher,
+                isbn=pdf_metadata.isbn,
+                authors=pdf_metadata.authors,
+                editors=pdf_metadata.editors,
+                translators=pdf_metadata.translators,
+                modified=pdf_metadata.modified,
+            )
+        except PDFError:
+            print("Warning: Failed to extract PDF metadata.")
+            return None

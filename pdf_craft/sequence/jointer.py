@@ -1,26 +1,54 @@
+from dataclasses import dataclass
 import re
 
-from typing import Generator, Iterable
+from typing import cast, Generator, Iterable
 
-from ..pdf import PageLayout
-from ..common import ASSET_TAGS
-from .chapter import ParagraphLayout, AssetLayout, LineLayout, Reference, InlineExpression
-from .language import is_latin_letter
 from ..expression import parse_latex_expressions, ExpressionKind, ParsedItem
 
+from ..pdf import TITLE_TAGS, PageLayout
+from ..common import ASSET_TAGS, AssetRef
+from ..language import is_latin_letter
+from ..markdown.paragraph import parse_raw_markdown
 
-TITLE_TAGS = ("title", "sub_title")
+from .chapter import ParagraphLayout, AssetLayout, BlockLayout, InlineExpression
+from .content import first, last, expand_text_in_content, Content
+from .reading_serials import split_reading_serials
+
 
 _ASSET_CAPTION_TAGS = tuple(f"{t}_caption" for t in ASSET_TAGS)
 
 # to see https://github.com/opendatalab/MinerU/blob/fa1149cd4abf9db5e0f13e4e074cdb568be189f4/mineru/utils/span_pre_proc.py#L247
 _LINE_STOP_FLAGS = (
-    ".", "!", "?", "。", "！", "？", ")", "）", """, """, ":", "：", ";", "；",
-    "]", "】", "}", "}", ">", "》", "、", ",", "，", "-", "—", "–",
+    ".", "!", "?", "。", "！", "？", ")", "）", """, """, ";", "；",
+    "]", "】", "}", ">", "》",
+)
+
+_LINE_CONTINUE_FLAGS = (
+    "[", "【", "{", "<", "《", "、", ",", "，",
+)
+
+_LINK_FLAGS = (
+    "‐", "‑", "‒", "–", "—", "―",
 )
 
 _MARKDOWN_HEAD_PATTERN = re.compile(r"^#+\s+")
 _TABLE_PATTERN = re.compile(r"<table[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+
+
+@dataclass
+class _LastTail:
+    page_para: ParagraphLayout
+    override: list[AssetLayout]
+
+@dataclass
+class _AssetHolder:
+    page_index: int
+    ref: AssetRef
+    det: tuple[int, int, int, int]
+    title: str | None
+    content: str
+    caption: str | None
+    hash: str | None
 
 
 class Jointer:
@@ -28,48 +56,118 @@ class Jointer:
         self._layouts = layouts
 
     def execute(self) -> Generator[ParagraphLayout | AssetLayout, None, None]:
-        last_page_para: ParagraphLayout | None = None
-        for page_index, raw_layouts in self._layouts:
-            layouts = self._transform_and_join_asset_layouts(page_index, raw_layouts)
-            if not layouts:
-                continue
+        last_tail: _LastTail | None = None
 
-            first_layout = layouts[0]
-            if last_page_para and isinstance(first_layout, ParagraphLayout) and \
-               self._can_merge_paragraphs(last_page_para, first_layout):
-                last_page_para.lines.extend(first_layout.lines)
-                del layouts[0]
+        for page_index, raw_layouts in self._iter_layout_serials():
+            # 此处为完成如下业务要求：
+            # 1. 当阅读序列跨越 group（跨页、跨分栏、跨因图片而挤变形拆分的段落）时，必须对连接处验证。若它们是被拆分的自然段，则拼起来。
+            # 2. 因为插图、表格而拆分的自然段，需将插图存起来接到完整的自然段最后，而不是任其分割自然段。
+            layouts = list(self._join_and_handle_asset_layouts(page_index, raw_layouts))
+            head, body, tail = self._split_layouts(layouts)
 
-            if not layouts:
-                continue
-
-            if last_page_para:
-                _normalize_paragraph_content(last_page_para)
-                yield last_page_para
-                last_page_para = None
-
-            for i in range(len(layouts) - 1):
-                yield layouts[i]
-
-            last_layout = layouts[-1]
-            if last_layout:
-                if isinstance(last_layout, ParagraphLayout):
-                    last_page_para = last_layout
+            if not body:
+                if last_tail:
+                    last_tail.override.extend(head)
+                    last_tail.override.extend(tail)
                 else:
-                    yield last_layout
+                    yield from head
+                    yield from tail
+                continue
 
-        if last_page_para:
-            _normalize_paragraph_content(last_page_para)
-            yield last_page_para
+            first_layout = cast(ParagraphLayout, body[0])
+            if last_tail and self._can_merge_paragraphs(last_tail.page_para, first_layout):
+                last_tail.page_para.blocks.extend(first_layout.blocks)
+                del body[0]
 
-    def _transform_and_join_asset_layouts(self, page_index, layouts: list[PageLayout]):
-        last_asset: AssetLayout | None = None
-        jointed_layouts: list[ParagraphLayout | AssetLayout] = []
+            if not body:
+                if last_tail:
+                    last_tail.override.extend(head)
+                    last_tail.override.extend(tail)
+                else:
+                    yield from head
+                    yield from tail
+                continue
+
+            # 至此，连续吞并段落的流程遇阻而结束
+            if last_tail:
+                _normalize_paragraph_content(last_tail.page_para)
+                yield last_tail.page_para
+                yield from last_tail.override
+                last_tail = None
+
+            yield from head
+            for i in range(len(body) - 1):
+                yield body[i]
+
+            last_tail = _LastTail(
+                page_para=cast(ParagraphLayout, body[-1]),
+                override=list(tail),
+            )
+
+        if last_tail:
+            _normalize_paragraph_content(last_tail.page_para)
+            yield last_tail.page_para
+            yield from last_tail.override
+
+    def _iter_layout_serials(self) -> Generator[tuple[int, list[PageLayout]], None, None]:
+        for page_index, raw_layouts in self._layouts:
+            for layouts in split_reading_serials(raw_layouts):
+                yield page_index, layouts
+
+    def _split_layouts(self, layouts: list[ParagraphLayout | AssetLayout]):
+        head: list[AssetLayout] = []
+        tail: list[AssetLayout] = []
+
+        for layout in layouts:
+            if isinstance(layout, ParagraphLayout):
+                break
+            head.append(layout)
+
+        for i in range(len(layouts) - 1, -1, -1):
+            if i < len(head):
+                break
+            layout = layouts[i]
+            if isinstance(layout, ParagraphLayout):
+                break
+            tail.append(layout)
+
+        tail.reverse()
+        body = layouts[len(head):len(layouts) - len(tail)]
+
+        return head, body, tail
+
+    def _join_and_handle_asset_layouts(self, page_index, layouts: list[PageLayout]) -> Generator[ParagraphLayout | AssetLayout, None, None]:
+        # layout 可能被后续处理，必须等待所有 layout 处理完毕
+        for layout in list(self._join_asset_layouts(
+            page_index=page_index,
+            layouts=layouts,
+        )):
+            if not isinstance(layout, _AssetHolder):
+                yield layout
+                continue
+
+            if layout.ref == "equation":
+                _normalize_equation(layout)
+            if layout.ref == "table":
+                _normalize_table(layout)
+
+            yield AssetLayout(
+                page_index=page_index,
+                ref=layout.ref,
+                det=layout.det,
+                title=_parse_block_content(layout.title),
+                content=_parse_block_content(layout.content),
+                caption=_parse_block_content(layout.caption),
+                hash=layout.hash,
+            )
+
+    def _join_asset_layouts(self, page_index, layouts: list[PageLayout]):
+        last_asset: _AssetHolder | None = None
         for layout in layouts:
             if layout.ref in ASSET_TAGS:
                 if last_asset:
-                    jointed_layouts.append(last_asset)
-                last_asset = AssetLayout(
+                    yield last_asset
+                last_asset = _AssetHolder(
                     page_index=page_index,
                     ref=layout.ref,
                     det=layout.det,
@@ -86,31 +184,24 @@ class Jointer:
                         last_asset.caption = layout.text
             else:
                 if last_asset:
-                    jointed_layouts.append(last_asset)
+                    yield last_asset
                     last_asset = None
                 if layout.ref in TITLE_TAGS:
                     # 将 Markdown 标题前的 `##` 之类的符号删除，DeepSeek OCR 总会生成这种符号
                     layout.text = _MARKDOWN_HEAD_PATTERN.sub("", layout.text)
 
-                jointed_layouts.append(ParagraphLayout(
+                yield ParagraphLayout(
                     ref=layout.ref,
-                    lines=[LineLayout(
+                    level=-1,
+                    blocks=[BlockLayout(
                         page_index=page_index,
+                        order=layout.order,
                         det=layout.det,
-                        content=_parse_line_content(layout.text),
+                        content=_parse_block_content(layout.text),
                     )],
-                ))
-
+                )
         if last_asset:
-            jointed_layouts.append(last_asset)
-
-        for layout in jointed_layouts:
-            if isinstance(layout, AssetLayout):
-                if layout.ref == "equation":
-                    _normalize_equation(layout)
-                if layout.ref == "table":
-                    _normalize_table(layout)
-        return jointed_layouts
+            yield last_asset
 
     # too see https://github.com/opendatalab/MinerU/blob/fa1149cd4abf9db5e0f13e4e074cdb568be189f4/mineru/backend/pipeline/para_split.py#L253
     def _can_merge_paragraphs(self, para1: ParagraphLayout, para2: ParagraphLayout) -> bool:
@@ -119,35 +210,26 @@ class Jointer:
         if para1.ref != para2.ref:
             return False
 
-        line1 = para1.lines[-1]
-        line2 = para2.lines[0]
-        det1, text1 = line1.det, _line_text(line1)
-        det2, text2 = line2.det, _line_text(line2)
+        block1 = para1.blocks[-1]
+        block2 = para2.blocks[0]
 
-        if not text1 or not text2:
+        text1 = last(block1.content)
+        text2 = first(block2.content)
+        if not isinstance(text1, str) or not isinstance(text2, str):
             return False
 
         text1_stripped = text1.rstrip()
-        if not text1_stripped:
-            return False
-
         text2_stripped = text2.lstrip()
-        if not text2_stripped:
+        if not text1_stripped or not text2_stripped:
             return False
 
-        # 条件1：前一个段落的末尾不以句尾符号结尾
-        # 如果以句尾符号结尾，说明是完整段落，不应合并
+        # 条件1：前一个段落如果以句尾符号结尾，说明是完整段落，不应合并
         if text1_stripped.endswith(_LINE_STOP_FLAGS):
             return False
 
-        layout_width1 = det1[2] - det1[0]
-        layout_width2 = det2[2] - det2[0]
-
-        # 条件2：两个段落的宽度相似
-        # 差异不应超过较小宽度
-        min_layout_width = min(layout_width1, layout_width2)
-        if abs(layout_width1 - layout_width2) >= min_layout_width:
-            return False
+        # 条件2：前一个段落结束的符号明显表明句子未结束，则必须合并
+        if text1_stripped.endswith(_LINE_CONTINUE_FLAGS):
+            return True
 
         first_char = text2_stripped[0]
 
@@ -161,13 +243,17 @@ class Jointer:
         if first_char.isupper():
             return False
 
-        # 条件5：如果 para1 结尾是拉丁字母+"-"，para2 开头是拉丁字母，则允许合并（跨段单词拼接）
-        if _is_splitted_word(text1, text2):
-            return True
+        # 条件5：如果 para1 结尾是拉丁字母 + `-`，para2 开头是拉丁字母，则允许合并（跨段单词拼接）
+        if is_latin_letter(text2[0]):
+            if len(text1) >= 2 and text1[-1] in _LINK_FLAGS and \
+               is_latin_letter(text1[-2]):
+                return True
+            if is_latin_letter(text1[-1]):
+                return False
 
         return True
 
-def _normalize_equation(layout: AssetLayout):
+def _normalize_equation(layout: _AssetHolder):
     if layout.ref != "equation" or not layout.content:
         return
 
@@ -203,7 +289,7 @@ def _normalize_equation(layout: AssetLayout):
         layout.caption = "".join(item.reverse() for item in tail_items)
 
 
-def _normalize_table(layout: AssetLayout):
+def _normalize_table(layout: _AssetHolder):
     found_table_content: str | None = None
     head_buffer: list[str] = []
     tail_buffer: list[str] = []
@@ -244,68 +330,65 @@ def _normalize_table(layout: AssetLayout):
     layout.caption = tail if tail else None
     layout.content = found_table_content
 
+# 将单词的连接符 `-` 删去，并将后半节单词移到前面一段拼接
 def _normalize_paragraph_content(paragraph: ParagraphLayout):
-    if len(paragraph.lines) < 2:
+    if len(paragraph.blocks) < 2:
         return
 
-    for i in range(1, len(paragraph.lines)):
-        line1 = paragraph.lines[i - 1]
-        line2 = paragraph.lines[i]
-        content1 = _line_text(line1).rstrip()
-        content2 = _line_text(line2).lstrip()
+    for i in range(1, len(paragraph.blocks)):
+        block1 = paragraph.blocks[i - 1]
+        block2 = paragraph.blocks[i]
 
-        if not _is_splitted_word(content1, content2):
+        text1 = last(block1.content)
+        text2 = first(block2.content)
+        if not isinstance(text1, str) or not isinstance(text2, str):
+            continue
+
+        text1 = text1.rstrip()
+        text2 = text2.lstrip()
+        if not _is_splitted_word(text1, text2):
             continue
 
         tail_end = 0
-        for j in range(len(content2)):
-            if is_latin_letter(content2[j]):
+        for j in range(len(text2)):
+            if is_latin_letter(text2[j]):
                 tail_end = j + 1
             else:
                 break
 
-        line1.content[0] = content1[:-1] + content2[:tail_end]
-        line2.content[0] = content2[tail_end:].lstrip()
+        block1.content[-1] = text1[:-1] + text2[:tail_end]
+        block2.content[0] = text2[tail_end:].lstrip()
+        if not block2.content[0]:
+            del block2.content[0]
 
-    paragraph.lines = [
-        line for line in paragraph.lines
-        if _line_text(line).strip()
-    ]
+    # 极端情况下 block2 会因为单词被移走而被清空。此时要将其整个删去。
+    paragraph.blocks = [block for block in paragraph.blocks if block.content]
 
-def _parse_line_content(text: str) -> list[str | InlineExpression | Reference]:
+def _parse_block_content(text: str | None) -> Content:
     if not text:
         return []
 
-    parsed_items = list(parse_latex_expressions(text))
-    result: list[str | InlineExpression | Reference] = []
+    root_content: Content = parse_raw_markdown(text)
 
-    for item in parsed_items:
-        if item.kind == ExpressionKind.TEXT:
-            if item.content:  # Only add non-empty strings
-                result.append(item.content)
-        else:
-            result.append(InlineExpression(
-                kind=item.kind,
-                content=item.content,
-            ))
+    def expand_text(text: str):
+        for item in parse_latex_expressions(text):
+            if item.kind != ExpressionKind.TEXT:
+                yield InlineExpression(
+                    kind=item.kind,
+                    content=item.content,
+                )
+            elif item.content: # Only add non-empty strings
+                yield item.content
 
-    return result
-
-def _line_text(line: LineLayout) -> str:
-    result_parts: list[str] = []
-    for part in line.content:
-        if isinstance(part, str):
-            result_parts.append(part)
-        # 对于 Reference 对象，我们可以选择忽略或者转换为特定格式
-        # 在 jointer 阶段，可能还需要原始文本，所以暂时转换为空字符串
-        elif isinstance(part, Reference):
-            # Reference 对象在这里暂时不处理，或者可以添加标记
-            pass
-    return "".join(result_parts)
+    expand_text_in_content(
+        content=root_content,
+        expand=expand_text,
+    )
+    return root_content
 
 def _is_splitted_word(text1: str, text2: str) -> bool:
     return (
-        len(text1) >= 2 and text1[-1] == "-" and \
+        len(text1) >= 2 and text1[-1] in _LINK_FLAGS and \
         is_latin_letter(text1[-2]) and \
         is_latin_letter(text2[0])
     )

@@ -1,7 +1,7 @@
 <div align=center>
   <h1>PDF Craft</h1>
   <p>
-    <a href="https://github.com/oomol-lab/pdf-craft/actions/workflows/build.yml" target="_blank"><img src="https://img.shields.io/github/actions/workflow/status/oomol-lab/pdf-craft/build.yml" alt"ci" /></a>
+    <a href="https://github.com/oomol-lab/pdf-craft/actions/workflows/merge-build.yml" target="_blank"><img src="https://img.shields.io/github/actions/workflow/status/oomol-lab/pdf-craft/merge-build.yml" alt"ci" /></a>
     <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/badge/pip_install-pdf--craft-blue" alt="pip install pdf-craft" /></a>
     <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/pypi/v/pdf-craft.svg" alt"pypi pdf-craft" /></a>
     <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/pypi/pyversions/pdf-craft.svg" alt="python versions" /></a>
@@ -91,6 +91,7 @@ transform_markdown(
     includes_footnotes=True,  # 可选：包含脚注
     ignore_pdf_errors=False,  # 可选：遇到 PDF 渲染错误时继续处理
     generate_plot=False,  # 可选：生成可视化图表
+    toc_assumed=False,  # 可选：假设 PDF 包含目录页
 )
 ```
 
@@ -109,6 +110,7 @@ transform_epub(
     includes_footnotes=True,  # 可选：包含脚注
     ignore_pdf_errors=False,  # 可选：遇到 PDF 渲染错误时继续处理
     generate_plot=False,  # 可选：生成可视化图表
+    toc_assumed=True,  # 可选：假设 PDF 包含目录页
     book_meta=BookMeta(
         title="书名",
         authors=["作者1", "作者2"],
@@ -195,6 +197,15 @@ transform_markdown(
 
 `inline_latex` 参数（仅 EPUB，默认：`True`）控制是否在输出中保留内联 LaTeX 表达式。启用后，内联数学公式将以 LaTeX 代码形式保留，可由支持的 EPUB 阅读器渲染。
 
+### 目录检测
+
+`toc_assumed` 参数控制 pdf-craft 是否假设 PDF 包含目录页：
+
+- 当为 `True` 时（EPUB 默认值）：pdf-craft 会尝试在 PDF 中定位并提取目录，使用它来构建文档结构
+- 当为 `False` 时（Markdown 默认值）：pdf-craft 仅基于文档标题生成目录
+
+对于包含专门目录部分的书籍，设置 `toc_assumed=True` 通常能生成更好的章节组织。
+
 ### 自定义 PDF 处理器
 
 默认情况下，pdf-craft 使用本地 Poppler（通过 `pdf2image`）进行 PDF 解析和渲染。如果 Poppler 不在系统 PATH 中，你可以指定自定义路径：
@@ -230,3 +241,4 @@ transform_markdown(
 
 - [DeepSeekOCR](https://github.com/deepseek-ai/DeepSeek-OCR)
 - [doc-page-extractor](https://github.com/Moskize91/doc-page-extractor)
+- [pyahocorasick](https://github.com/WojciechMula/pyahocorasick)

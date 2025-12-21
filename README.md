@@ -1,7 +1,7 @@
 <div align=center>
   <h1>PDF Craft</h1>
   <p>
-    <a href="https://github.com/oomol-lab/pdf-craft/actions/workflows/build.yml" target="_blank"><img src="https://img.shields.io/github/actions/workflow/status/oomol-lab/pdf-craft/build.yml" alt"ci" /></a>
+    <a href="https://github.com/oomol-lab/pdf-craft/actions/workflows/merge-build.yml" target="_blank"><img src="https://img.shields.io/github/actions/workflow/status/oomol-lab/pdf-craft/merge-build.yml" alt"ci" /></a>
     <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/badge/pip_install-pdf--craft-blue" alt="pip install pdf-craft" /></a>
     <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/pypi/v/pdf-craft.svg" alt"pypi pdf-craft" /></a>
     <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/pypi/pyversions/pdf-craft.svg" alt="python versions" /></a>
@@ -55,7 +55,7 @@ transform_markdown(
 )
 ```
 
-![](docs/images/pdf2md-en.png)
+![mdmd](https://github.com/user-attachments/assets/d7082496-13b8-4728-9e79-44e2888e57fd)
 
 #### Convert to EPUB
 
@@ -72,7 +72,7 @@ transform_epub(
 )
 ```
 
-![](docs/images/pdf2epub-en.png)
+![20251218-144958](https://github.com/user-attachments/assets/c66ebdf6-cf8f-4f1c-a0ba-0c44edaae664)
 
 ## Detailed Usage
 
@@ -91,6 +91,7 @@ transform_markdown(
     includes_footnotes=True,  # Optional: include footnotes
     ignore_pdf_errors=False,  # Optional: continue on PDF rendering errors
     generate_plot=False,  # Optional: generate visualization charts
+    toc_assumed=False,  # Optional: assume PDF contains a table of contents page
 )
 ```
 
@@ -109,6 +110,7 @@ transform_epub(
     includes_footnotes=True,  # Optional: include footnotes
     ignore_pdf_errors=False,  # Optional: continue on PDF rendering errors
     generate_plot=False,  # Optional: generate visualization charts
+    toc_assumed=True,  # Optional: assume PDF contains a table of contents page
     book_meta=BookMeta(
         title="Book Title",
         authors=["Author 1", "Author 2"],
@@ -195,6 +197,15 @@ The `ocr_size` parameter accepts a `DeepSeekOCRSize` type:
 
 The `inline_latex` parameter (EPUB only, default: `True`) controls whether to preserve inline LaTeX expressions in the output. When enabled, inline mathematical formulas are preserved as LaTeX code, which can be rendered by compatible EPUB readers.
 
+### Table of Contents Detection
+
+The `toc_assumed` parameter controls whether pdf-craft should assume the PDF contains a table of contents page:
+
+- When `True` (default for EPUB): pdf-craft attempts to locate and extract the table of contents from within the PDF, using it to build the document structure
+- When `False` (default for Markdown): pdf-craft generates the table of contents based on document headings only
+
+For books with a dedicated table of contents section, setting `toc_assumed=True` typically produces better chapter organization.
+
 ### Custom PDF Handler
 
 By default, pdf-craft uses Poppler (via `pdf2image`) for PDF parsing and rendering. If Poppler is not in your system PATH, you can specify a custom path:
@@ -230,3 +241,4 @@ Starting from v1.0.0, pdf-craft has fully migrated to DeepSeek OCR (MIT license)
 
 - [DeepSeekOCR](https://github.com/deepseek-ai/DeepSeek-OCR)
 - [doc-page-extractor](https://github.com/Moskize91/doc-page-extractor)
+- [pyahocorasick](https://github.com/WojciechMula/pyahocorasick)
